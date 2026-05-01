@@ -1,5 +1,5 @@
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Response
@@ -182,6 +182,12 @@ async def reply(body: ReplyBody) -> Dict[str, Any]:
     conv.setdefault("turns", []).append({"from": body.from_role, "body": body.message})
     conversations[body.conversation_id] = conv
 
+    trigger = _get_context("trigger", conv.get("trigger_id", "")) if conv else None
+    trigger_kind = conv.get("trigger_kind") or (trigger.get("kind") if trigger else None)
+    merchant = _get_context("merchant", body.merchant_id) or {}
+    category = _get_context("category", merchant.get("category_slug", "")) or {}
+    customer = _get_context("customer", body.customer_id) if body.customer_id else None
+
     normalized = _normalize_text(body.message)
 
     if _is_stop_message(normalized):
@@ -189,7 +195,7 @@ async def reply(body: ReplyBody) -> Dict[str, Any]:
 
     if _is_auto_reply(normalized, conv):
         hits = _record_auto_reply(body.merchant_id, normalized)
-        if hits >= 2:
+        if _is_repeat_in_conversation(conv, normalized) or hits >= 2:
             return {"action": "end", "rationale": "Detected repeated auto-reply."}
         return {
             "action": "send",
@@ -201,8 +207,33 @@ async def reply(body: ReplyBody) -> Dict[str, Any]:
             "rationale": "Auto-reply detected; trying one last handoff.",
         }
 
+    recall_response = _reply_recall_due(trigger, normalized)
+    if recall_response:
+        return recall_response
+
+    if _mentions_checklist(normalized):
+        return {
+            "action": "send",
+            "body": "Sharing the checklist now. Want a 2-line summary for your team as well? Reply YES or STOP.",
+            "cta": "yes_no",
+            "rationale": "Merchant asked for compliance checklist.",
+        }
+
+    if _mentions_pricing(normalized):
+        offer = _pick_offer(merchant, category)
+        if offer:
+            body_text = f"Should I use {offer} as the headline, or share a different price point?"
+        else:
+            body_text = "Share the top service + price, and I will draft the message." 
+        return {
+            "action": "send",
+            "body": body_text,
+            "cta": "open_ended",
+            "rationale": "Merchant asked about pricing; collecting offer details.",
+        }
+
     if _is_positive_intent(normalized):
-        followup = _followup_for_trigger(conv.get("trigger_kind"))
+        followup = _followup_for_trigger(trigger_kind, trigger, merchant, category, customer)
         return {
             "action": "send",
             "body": followup["body"],
@@ -211,14 +242,19 @@ async def reply(body: ReplyBody) -> Dict[str, Any]:
         }
 
     if _looks_like_question(body.message, normalized):
+        question_reply = _question_reply_for_trigger(trigger_kind, trigger, merchant, category)
+        if question_reply:
+            return question_reply
         return {
             "action": "send",
-            "body": (
-                "Got it. Share the exact detail you want, and I will draft it right away."
-            ),
+            "body": "Got it. Share the exact detail you want, and I will draft it right away.",
             "cta": "open_ended",
             "rationale": "Merchant asked a question; requesting the specific detail.",
         }
+
+    fallback = _fallback_reply_for_trigger(trigger_kind, trigger, merchant, category, customer)
+    if fallback:
+        return fallback
 
     return {
         "action": "send",
@@ -806,6 +842,7 @@ def _trigger_priority_score(trigger: Dict[str, Any]) -> int:
         "active_planning_intent": 100,
         "recall_due": 90,
         "supply_alert": 90,
+        "ipl_match_today": 85,
         "renewal_due": 80,
         "perf_dip": 70,
         "review_theme_emerged": 65,
@@ -842,7 +879,13 @@ def _is_expired(trigger: Dict[str, Any], now: Optional[datetime]) -> bool:
     if not expires_at:
         return False
     exp = _parse_dt(expires_at)
-    return bool(exp and exp < now)
+    if not exp:
+        return False
+    if exp >= now:
+        return False
+    if trigger.get("kind") == "ipl_match_today":
+        return now - exp > timedelta(hours=12)
+    return True
 
 
 def _normalize_text(text: str) -> str:
@@ -884,6 +927,15 @@ def _is_auto_reply(normalized: str, conv: Dict[str, Any]) -> bool:
     return False
 
 
+def _is_repeat_in_conversation(conv: Dict[str, Any], normalized: str) -> bool:
+    last_messages = [
+        t.get("body", "") for t in conv.get("turns", []) if t.get("from") in ["merchant", "customer"]
+    ]
+    if len(last_messages) < 2:
+        return False
+    return _normalize_text(last_messages[-1]) == _normalize_text(last_messages[-2])
+
+
 def _record_auto_reply(merchant_id: str, normalized: str) -> int:
     now = time.time()
     entry = auto_reply_tracker.get(merchant_id, {"text": "", "count": 0, "ts": 0.0})
@@ -918,7 +970,21 @@ def _looks_like_question(raw: str, normalized: str) -> bool:
     return "?" in raw or any(word in normalized for word in question_words)
 
 
-def _followup_for_trigger(trigger_kind: Optional[str]) -> Dict[str, str]:
+def _mentions_checklist(normalized: str) -> bool:
+    return any(word in normalized for word in ["checklist", "audit", "compliance"])
+
+
+def _mentions_pricing(normalized: str) -> bool:
+    return any(word in normalized for word in ["price", "pricing", "rate", "cost", "offer"])
+
+
+def _followup_for_trigger(
+    trigger_kind: Optional[str],
+    trigger: Optional[Dict[str, Any]],
+    merchant: Dict[str, Any],
+    category: Dict[str, Any],
+    customer: Optional[Dict[str, Any]],
+) -> Dict[str, str]:
     if trigger_kind == "research_digest":
         return {
             "body": "Sharing the abstract now. Want a patient-facing WhatsApp draft too? Reply YES or STOP.",
@@ -949,11 +1015,233 @@ def _followup_for_trigger(trigger_kind: Optional[str]) -> Dict[str, str]:
             "cta": "open_ended",
             "rationale": "Merchant accepted review response follow-up.",
         }
+    if trigger_kind == "competitor_opened":
+        offer = _pick_offer(merchant, category)
+        competitor = _safe_get(trigger or {}, "payload", "competitor_name") or "the new listing"
+        return {
+            "body": f"Got it. Should I counter {competitor} with {offer or 'a new offer'}?",
+            "cta": "open_ended",
+            "rationale": "Merchant accepted competitor follow-up.",
+        }
+    if trigger_kind == "ipl_match_today":
+        offer = _pick_offer(merchant, category)
+        match = _safe_get(trigger or {}, "payload", "match") or "today's match"
+        return {
+            "body": f"Ok. I will draft a {match} special using {offer or 'your top dish/offer'}. Delivery-only or dine-in focus?",
+            "cta": "open_ended",
+            "rationale": "Merchant accepted IPL match follow-up.",
+        }
+    if trigger_kind == "recall_due":
+        slot_text = _slot_prompt(trigger)
+        return {
+            "body": slot_text,
+            "cta": "open_ended",
+            "rationale": "Merchant accepted recall follow-up; offering slots.",
+        }
     return {
-        "body": "Got it. Share any preference, and I will prepare the draft.",
+        "body": "Great. Tell me the top service and price to highlight, and I will draft it.",
         "cta": "open_ended",
         "rationale": "Generic positive intent follow-up.",
     }
+
+
+def _question_reply_for_trigger(
+    trigger_kind: Optional[str],
+    trigger: Optional[Dict[str, Any]],
+    merchant: Dict[str, Any],
+    category: Dict[str, Any],
+) -> Optional[Dict[str, str]]:
+    if trigger_kind == "regulation_change":
+        deadline = _safe_get(trigger or {}, "payload", "deadline_iso")
+        return {
+            "action": "send",
+            "body": f"Deadline is {deadline}. Want the 3-step checklist now? Reply YES or STOP.",
+            "cta": "yes_no",
+            "rationale": "Answered compliance question with deadline anchor.",
+        }
+    if trigger_kind == "review_theme_emerged":
+        theme = _safe_get(trigger or {}, "payload", "theme") or "this issue"
+        return {
+            "action": "send",
+            "body": f"I can draft a response for the {theme} reviews. English or Hindi?",
+            "cta": "open_ended",
+            "rationale": "Clarifying review response language.",
+        }
+    if trigger_kind == "ipl_match_today":
+        offer = _pick_offer(merchant, category)
+        return {
+            "action": "send",
+            "body": f"I can draft the match-night post. Use {offer or 'your top offer'} or a new price point?",
+            "cta": "open_ended",
+            "rationale": "Clarifying IPL offer.",
+        }
+    return None
+
+
+def _reply_recall_due(trigger: Optional[Dict[str, Any]], normalized: str) -> Optional[Dict[str, Any]]:
+    if not trigger or trigger.get("kind") != "recall_due":
+        return None
+    slots = _safe_get(trigger, "payload", "available_slots") or []
+    slot_labels = [s.get("label") for s in slots if s.get("label")]
+    if normalized in ["1", "one"] and len(slot_labels) >= 1:
+        return {
+            "action": "send",
+            "body": f"Booked {slot_labels[0]}. Please confirm patient name and phone.",
+            "cta": "open_ended",
+            "rationale": "Slot selected for recall appointment.",
+        }
+    if normalized in ["2", "two"] and len(slot_labels) >= 2:
+        return {
+            "action": "send",
+            "body": f"Booked {slot_labels[1]}. Please confirm patient name and phone.",
+            "cta": "open_ended",
+            "rationale": "Slot selected for recall appointment.",
+        }
+    if any(word in normalized for word in ["yes", "ok", "sure", "confirm"]):
+        return {
+            "action": "send",
+            "body": _slot_prompt(trigger),
+            "cta": "open_ended",
+            "rationale": "Prompting for slot selection.",
+        }
+    return None
+
+
+def _fallback_reply_for_trigger(
+    trigger_kind: Optional[str],
+    trigger: Optional[Dict[str, Any]],
+    merchant: Dict[str, Any],
+    category: Dict[str, Any],
+    customer: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not trigger_kind:
+        return None
+    if trigger_kind == "ipl_match_today":
+        offer = _pick_offer(merchant, category)
+        return {
+            "action": "send",
+            "body": f"Should I draft a match-night post for {offer or 'your top offer'}? Delivery-only or dine-in focus?",
+            "cta": "open_ended",
+            "rationale": "Default IPL follow-up prompt.",
+        }
+    if trigger_kind == "regulation_change":
+        deadline = _safe_get(trigger or {}, "payload", "deadline_iso")
+        return {
+            "action": "send",
+            "body": f"Deadline is {deadline}. Want the 3-step checklist now? Reply YES or STOP.",
+            "cta": "yes_no",
+            "rationale": "Default compliance follow-up prompt.",
+        }
+    if trigger_kind in ["perf_dip", "perf_spike", "seasonal_perf_dip"]:
+        return {
+            "action": "send",
+            "body": "Which service and price should I highlight? Share one, and I will draft the post.",
+            "cta": "open_ended",
+            "rationale": "Default performance follow-up prompt.",
+        }
+    if trigger_kind == "review_theme_emerged":
+        return {
+            "action": "send",
+            "body": "I can draft a response template. English or Hindi?",
+            "cta": "open_ended",
+            "rationale": "Default review follow-up prompt.",
+        }
+    if trigger_kind == "competitor_opened":
+        offer = _pick_offer(merchant, category)
+        return {
+            "action": "send",
+            "body": f"Want me to counter with {offer or 'a new offer'} or match their price?",
+            "cta": "open_ended",
+            "rationale": "Default competitor follow-up prompt.",
+        }
+    if trigger_kind == "recall_due":
+        return {
+            "action": "send",
+            "body": _slot_prompt(trigger),
+            "cta": "open_ended",
+            "rationale": "Default recall follow-up prompt.",
+        }
+    if trigger_kind == "renewal_due":
+        return {
+            "action": "send",
+            "body": "Want me to share renewal steps? Reply YES or STOP.",
+            "cta": "yes_no",
+            "rationale": "Default renewal follow-up prompt.",
+        }
+    if trigger_kind == "supply_alert":
+        return {
+            "action": "send",
+            "body": "Want the affected customer list now? Reply YES or STOP.",
+            "cta": "yes_no",
+            "rationale": "Default supply alert follow-up prompt.",
+        }
+    if trigger_kind == "gbp_unverified":
+        return {
+            "action": "send",
+            "body": "Should I start the verification flow now? Reply YES or STOP.",
+            "cta": "yes_no",
+            "rationale": "Default GBP verification follow-up prompt.",
+        }
+    if trigger_kind == "research_digest":
+        return {
+            "action": "send",
+            "body": "Want the abstract and a patient-facing WhatsApp draft? Reply YES or STOP.",
+            "cta": "yes_no",
+            "rationale": "Default research digest follow-up prompt.",
+        }
+    if trigger_kind == "curious_ask_due":
+        return {
+            "action": "send",
+            "body": "Which service is most asked-for this week? I will draft a post from it.",
+            "cta": "open_ended",
+            "rationale": "Default curious-ask follow-up prompt.",
+        }
+    if trigger_kind == "milestone_reached":
+        return {
+            "action": "send",
+            "body": "Want a short review-ask message to hit the milestone? Reply YES or STOP.",
+            "cta": "yes_no",
+            "rationale": "Default milestone follow-up prompt.",
+        }
+    if trigger_kind == "category_seasonal":
+        return {
+            "action": "send",
+            "body": "Want a quick seasonal update plan for your listing? Reply YES or STOP.",
+            "cta": "yes_no",
+            "rationale": "Default seasonal follow-up prompt.",
+        }
+    if trigger_kind == "active_planning_intent":
+        return {
+            "action": "send",
+            "body": "Share target price and timing, and I will draft the outline.",
+            "cta": "open_ended",
+            "rationale": "Default planning follow-up prompt.",
+        }
+    if trigger_kind == "dormant_with_vera":
+        return {
+            "action": "send",
+            "body": "Should I continue the last topic or switch to something else?",
+            "cta": "open_ended",
+            "rationale": "Default dormant follow-up prompt.",
+        }
+    if trigger_kind == "winback_eligible":
+        return {
+            "action": "send",
+            "body": "Want a winback message drafted for your lapsed customers? Reply YES or STOP.",
+            "cta": "yes_no",
+            "rationale": "Default winback follow-up prompt.",
+        }
+    return None
+
+
+def _slot_prompt(trigger: Optional[Dict[str, Any]]) -> str:
+    slots = _safe_get(trigger or {}, "payload", "available_slots") or []
+    slot_labels = [s.get("label") for s in slots if s.get("label")]
+    if len(slot_labels) >= 2:
+        return f"Reply 1 for {slot_labels[0]} or 2 for {slot_labels[1]}."
+    if len(slot_labels) == 1:
+        return f"Next available: {slot_labels[0]}. Reply YES to confirm or share a time."
+    return "Share a preferred time and I will book it."
 
 
 def _safe_get(data: Dict[str, Any], *keys: str) -> Optional[Any]:
