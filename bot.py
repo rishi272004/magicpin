@@ -2,7 +2,7 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Response
 from pydantic import BaseModel
 
 app = FastAPI()
@@ -38,10 +38,8 @@ class ReplyBody(BaseModel):
     turn_number: int
 
 
-@app.api_route("/v1/healthz", methods=["GET", "HEAD"])
-async def healthz(request: Request) -> Dict[str, Any] | Response:
-    if request.method == "HEAD":
-        return Response(status_code=200)
+@app.get("/v1/healthz")
+async def healthz() -> Dict[str, Any]:
     counts = {"category": 0, "merchant": 0, "customer": 0, "trigger": 0}
     for (scope, _), _ in contexts.items():
         counts[scope] = counts.get(scope, 0) + 1
@@ -52,11 +50,19 @@ async def healthz(request: Request) -> Dict[str, Any] | Response:
     }
 
 
-@app.api_route("/", methods=["GET", "HEAD"])
-async def root(request: Request) -> Dict[str, str] | Response:
-    if request.method == "HEAD":
-        return Response(status_code=200)
+@app.head("/v1/healthz")
+async def healthz_head() -> Response:
+    return Response(status_code=200)
+
+
+@app.get("/")
+async def root() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.head("/")
+async def root_head() -> Response:
+    return Response(status_code=200)
 
 
 @app.get("/v1/metadata")
