@@ -2,7 +2,7 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from pydantic import BaseModel
 
 app = FastAPI()
@@ -48,6 +48,11 @@ async def healthz() -> Dict[str, Any]:
         "uptime_seconds": int(time.time() - START_TIME),
         "contexts_loaded": counts,
     }
+
+
+@app.head("/v1/healthz")
+async def healthz_head() -> Response:
+    return Response(status_code=200)
 
 
 @app.get("/v1/metadata")
